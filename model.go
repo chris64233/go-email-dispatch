@@ -14,6 +14,8 @@ const (
 	CampaignDraft CampaignStatus = "draft"
 	// CampaignRunning 已启动：模板版本与受众快照不可变，可以领取与授权发送。
 	CampaignRunning CampaignStatus = "running"
+	// CampaignPaused 已暂停：不再领取/授权新邮件；已授权的在途邮件可继续完成并接收回执。
+	CampaignPaused CampaignStatus = "paused"
 	// CampaignCanceled 已取消：不再授权任何新邮件。
 	CampaignCanceled CampaignStatus = "canceled"
 )
@@ -26,6 +28,7 @@ const (
 	TaskLeased     TaskState = "leased"     // 已被某个工作者租约持有，尚未授权
 	TaskAuthorized TaskState = "authorized" // 已越过持久化发送授权点，允许实际投递
 	TaskRetryWait  TaskState = "retry_wait" // 临时失败，等待退避后重试
+	TaskPaused     TaskState = "paused"     // 暂停围栏：租约被撤销，等待活动恢复后重新领取
 	TaskSent       TaskState = "sent"       // 终态：成功
 	TaskFailed     TaskState = "failed"     // 终态：永久失败或重试耗尽
 	TaskSuppressed TaskState = "suppressed" // 终态：授权点被抑制拦截
@@ -171,6 +174,8 @@ type Campaign struct {
 	RetryPolicy RetryPolicy `json:"retry_policy"`
 	CreatedAt   time.Time   `json:"created_at"`
 	StartedAt   time.Time   `json:"started_at,omitempty"`
+	PausedAt    time.Time   `json:"paused_at,omitempty"`
+	ResumedAt   time.Time   `json:"resumed_at,omitempty"`
 	CanceledAt  time.Time   `json:"canceled_at,omitempty"`
 }
 
@@ -229,6 +234,7 @@ type AuthDecision struct {
 // 授权拒绝原因码。
 const (
 	ReasonCampaignCanceled   = "campaign_canceled"
+	ReasonCampaignPaused     = "campaign_paused"
 	ReasonCampaignSuppressed = "campaign_suppressed"
 	ReasonGlobalUnsubscribe  = "global_unsubscribe"
 	ReasonBounce             = "bounce"
@@ -308,10 +314,14 @@ type CampaignStats struct {
 	Leased          int            `json:"leased"`
 	Authorized      int            `json:"authorized"`
 	RetryWait       int            `json:"retry_wait"`
+	Paused          int            `json:"paused"`
 	Sent            int            `json:"sent"`
 	Failed          int            `json:"failed"`
 	Suppressed      int            `json:"suppressed"`
 	Canceled        int            `json:"canceled"`
+	// PausedIntercepted 累计因暂停围栏而未获授权的邮件数（每个投递项在一次暂停中至多计一次，
+	// 恢复/再次暂停会继续累加）；与主动取消（canceled）和实际发送（sent）相区分。
+	PausedIntercepted int `json:"paused_intercepted"`
 	// TotalAttempts 是累计租约尝试次数（每次重试 +1）。
 	TotalAttempts int `json:"total_attempts"`
 	Terminal      int `json:"terminal"`

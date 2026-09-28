@@ -200,6 +200,18 @@ func (svc *Service) RecordSuppression(in SuppressionInput) (*SuppressionEvent, e
 	return ev, nil
 }
 
+// Pause 暂停活动。暂停后不再领取新发送项、未授权的在途租约被围栏（授权点持久化 campaign_paused 拒绝）；
+// 已经授权的邮件可以完成并接收回执。重复暂停返回 Changed=false，幂等。
+func (svc *Service) Pause(campaignID string) (*Campaign, bool, error) {
+	return svc.store.PauseCampaign(campaignID, svc.now().UTC())
+}
+
+// Resume 恢复活动：被暂停围栏的投递项回到 pending，沿用启动时冻结的收件人与模板版本重新领取；
+// 暂停期间新生效的退订/退信会在恢复后的授权点照常拦截。重复恢复返回 Changed=false，幂等。
+func (svc *Service) Resume(campaignID string) (*Campaign, bool, error) {
+	return svc.store.ResumeCampaign(campaignID, svc.now().UTC())
+}
+
 // Cancel 取消活动。取消后不再授权任何新邮件；重复取消返回稳定结果（Changed=false），幂等。
 func (svc *Service) Cancel(campaignID string) (*Campaign, bool, error) {
 	c, changed, err := svc.store.CancelCampaign(campaignID, svc.now().UTC())

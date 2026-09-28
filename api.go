@@ -32,6 +32,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	POST   /v1/campaigns/{id}/start                          启动：锁定模板版本、冻结受众
 	GET    /v1/campaigns/{id}                                查询活动
 	POST   /v1/campaigns/{id}/leases                         领取发送项（有期限租约）
+	POST   /v1/campaigns/{id}/pause                          暂停活动（幂等）
+	POST   /v1/campaigns/{id}/resume                         恢复活动（幂等）
 	POST   /v1/campaigns/{id}/cancel                         取消活动（幂等）
 	GET    /v1/campaigns/{id}/stats                          统计查询
 	GET    /v1/campaigns/{id}/dispatches/{key}               投递项审计轨迹
@@ -44,6 +46,8 @@ func (h *Handler) routes() {
 	h.mux.HandleFunc("POST /v1/campaigns/{id}/start", h.startCampaign)
 	h.mux.HandleFunc("GET /v1/campaigns/{id}", h.getCampaign)
 	h.mux.HandleFunc("POST /v1/campaigns/{id}/leases", h.lease)
+	h.mux.HandleFunc("POST /v1/campaigns/{id}/pause", h.pause)
+	h.mux.HandleFunc("POST /v1/campaigns/{id}/resume", h.resume)
 	h.mux.HandleFunc("POST /v1/campaigns/{id}/cancel", h.cancel)
 	h.mux.HandleFunc("GET /v1/campaigns/{id}/stats", h.stats)
 	h.mux.HandleFunc("GET /v1/campaigns/{id}/dispatches/{key}", h.getDispatch)
@@ -74,7 +78,7 @@ type suppressionRequestDTO struct {
 	OccurredAtMS *int64          `json:"occurred_at_ms,omitempty"`
 }
 
-type cancelResponseDTO struct {
+type stateChangeResponseDTO struct {
 	Campaign *Campaign `json:"campaign"`
 	Changed  bool      `json:"changed"`
 }
@@ -139,13 +143,31 @@ func (h *Handler) lease(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"tasks": tasks})
 }
 
+func (h *Handler) pause(w http.ResponseWriter, r *http.Request) {
+	c, changed, err := h.svc.Pause(r.PathValue("id"))
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, stateChangeResponseDTO{Campaign: c, Changed: changed})
+}
+
+func (h *Handler) resume(w http.ResponseWriter, r *http.Request) {
+	c, changed, err := h.svc.Resume(r.PathValue("id"))
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, stateChangeResponseDTO{Campaign: c, Changed: changed})
+}
+
 func (h *Handler) cancel(w http.ResponseWriter, r *http.Request) {
 	c, changed, err := h.svc.Cancel(r.PathValue("id"))
 	if err != nil {
 		writeDomainError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, cancelResponseDTO{Campaign: c, Changed: changed})
+	writeJSON(w, http.StatusOK, stateChangeResponseDTO{Campaign: c, Changed: changed})
 }
 
 func (h *Handler) stats(w http.ResponseWriter, r *http.Request) {

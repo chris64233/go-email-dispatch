@@ -196,7 +196,77 @@ func TestAPIEndToEnd(t *testing.T) {
 	}
 }
 
-// TestAPIStaleLeaseConflict 过期租约旧回执经 HTTP 返回 409 stale_attempt。
+// TestAPIPauseResume 暂停/恢复接口的 HTTP 语义：幂等 changed、领取 409、围栏拒绝、恢复后重新发送。
+func TestAPIPauseResume(t *testing.T) {
+	srv, svc, _ := newTestServer()
+	defer srv.Close()
+
+	id := mustStart(t, svc, "tpl-1", "a@x.com")
+	task := mustLeaseOne(t, svc, id, "w1")
+
+	// 暂停：200 changed=true，活动 paused。
+	status, body := doJSON(t, srv, http.MethodPost, "/v1/campaigns/"+id+"/pause", map[string]any{})
+	if status != http.StatusOK || body["changed"] != true || asMap(t, body["campaign"])["status"] != string(CampaignPaused) {
+		t.Fatalf("pause: %d %v", status, body)
+	}
+	// 重复暂停：changed=false。
+	status, body = doJSON(t, srv, http.MethodPost, "/v1/campaigns/"+id+"/pause", map[string]any{})
+	if status != http.StatusOK || body["changed"] != false {
+		t.Fatalf("idempotent pause: %d %v", status, body)
+	}
+	// 暂停期间领取：409 campaign_not_running。
+	status, body = doJSON(t, srv, http.MethodPost, "/v1/campaigns/"+id+"/leases",
+		map[string]any{"worker_id": "w2"})
+	if status != http.StatusConflict || asMap(t, body["error"])["code"] != string(ErrCampaignNotReady) {
+		t.Fatalf("lease while paused: %d %v", status, body)
+	}
+	// 围栏任务授权：200 granted=false reason=campaign_paused。
+	status, body = doJSON(t, srv, http.MethodPost,
+		"/v1/campaigns/"+id+"/dispatches/"+task.DispatchKey+"/authorize",
+		map[string]any{"lease_token": task.LeaseToken})
+	if status != http.StatusOK || body["granted"] != false || body["reason"] != string(ReasonCampaignPaused) {
+		t.Fatalf("fenced authorize: %d %v", status, body)
+	}
+
+	// 恢复后旧 token 仍被围栏，新租约可完成发送。
+	status, _ = doJSON(t, srv, http.MethodPost, "/v1/campaigns/"+id+"/resume", map[string]any{})
+	if status != http.StatusOK {
+		t.Fatalf("resume: %d", status)
+	}
+	status, body = doJSON(t, srv, http.MethodPost, "/v1/campaigns/"+id+"/leases",
+		map[string]any{"worker_id": "w2", "lease_duration_ms": 60000})
+	if status != http.StatusOK {
+		t.Fatalf("lease after resume: %d %v", status, body)
+	}
+	tasks, _ := body["tasks"].([]any)
+	if len(tasks) != 1 {
+		t.Fatalf("expected 1 task after resume, got %v", body)
+	}
+	fresh := asMap(t, tasks[0])
+	if fresh["attempt"] != float64(2) || fresh["template_version"] != "tpl-1" {
+		t.Fatalf("resumed lease should be attempt 2 with frozen template: %v", fresh)
+	}
+	key, token := fresh["dispatch_key"].(string), fresh["lease_token"].(string)
+	status, body = doJSON(t, srv, http.MethodPost,
+		"/v1/campaigns/"+id+"/dispatches/"+key+"/authorize",
+		map[string]any{"lease_token": token})
+	if status != http.StatusOK || body["granted"] != true {
+		t.Fatalf("authorize after resume: %d %v", status, body)
+	}
+	status, body = doJSON(t, srv, http.MethodPost,
+		"/v1/campaigns/"+id+"/dispatches/"+key+"/receipts",
+		map[string]any{"lease_token": token, "result": "success"})
+	if status != http.StatusOK || body["state"] != string(TaskSent) {
+		t.Fatalf("receipt after resume: %d %v", status, body)
+	}
+
+	// 统计中区分暂停拦截与实际发送。
+	status, body = doJSON(t, srv, http.MethodGet, "/v1/campaigns/"+id+"/stats", nil)
+	if status != http.StatusOK || body["sent"] != float64(1) || body["paused_intercepted"] != float64(1) ||
+		body["canceled"] != float64(0) {
+		t.Fatalf("stats: %d %v", status, body)
+	}
+}
 func TestAPIStaleLeaseConflict(t *testing.T) {
 	srv, svc, clk := newTestServer()
 	defer srv.Close()

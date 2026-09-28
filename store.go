@@ -21,6 +21,10 @@ type Store interface {
 	GetCampaign(id string) (*Campaign, error)
 	// StartCampaign 冻结模板版本与受众，并为每个收件人创建 pending 投递项。
 	StartCampaign(c *Campaign, templateVersion string, recipients []Recipient, at time.Time) error
+	// PauseCampaign 暂停活动并围栏所有已领取未授权的投递项；重复暂停返回 changed=false。
+	PauseCampaign(id string, at time.Time) (*Campaign, bool, error)
+	// ResumeCampaign 恢复活动：被围栏的投递项回到 pending，沿用冻结收件人与模板重新领取。
+	ResumeCampaign(id string, at time.Time) (*Campaign, bool, error)
 	CancelCampaign(id string, at time.Time) (*Campaign, bool, error)
 
 	RecordSuppression(ev *SuppressionEvent) error
@@ -43,6 +47,8 @@ type taskRow struct {
 	task      Task
 	recipient Recipient
 	attempts  map[int]*AttemptRecord
+	// pauseIntercepts 累计该投递项被暂停围栏的次数（每次暂停对同一在途 attempt 只计一次）。
+	pauseIntercepts int
 }
 
 type memoryStore struct {
@@ -150,6 +156,101 @@ func (s *memoryStore) StartCampaign(c *Campaign, templateVersion string, recipie
 	return nil
 }
 
+func (s *memoryStore) PauseCampaign(id string, at time.Time) (*Campaign, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	c, ok := s.campaigns[id]
+	if !ok {
+		return nil, false, newError(opStore, ErrNotFound, "campaign %s not found", id)
+	}
+	// 重复暂停返回稳定结果：changed=false，状态保持 paused。
+	if c.Status == CampaignPaused {
+		cp := *c
+		return &cp, false, nil
+	}
+	if c.Status != CampaignRunning {
+		return nil, false, newError(opStore, ErrConflict, "campaign %s is %s, only running campaigns can pause", id, c.Status)
+	}
+	c.Status = CampaignPaused
+	c.PausedAt = at
+
+	for _, key := range s.taskOrder[id] {
+		row := s.tasks[key]
+		switch row.task.State {
+		case TaskLeased:
+			// 已领取但尚未越过授权点：在当前 attempt 上持久化拒绝决策并围栏。
+			// 决策不可变，旧工作者之后无论调用授权还是回执都只能得到这一稳定结论。
+			cur := row.attempts[row.task.Attempt]
+			if cur != nil && cur.Decision == nil {
+				dec := &AuthDecision{
+					ID:      s.nextAuthID,
+					Attempt: cur.Number,
+					Granted: false,
+					Reason:  ReasonCampaignPaused,
+					At:      at,
+				}
+				s.nextAuthID++
+				cur.Decision = dec
+				row.pauseIntercepts++
+			}
+			row.task.State = TaskPaused
+			row.task.AuthID = 0
+			row.task.AuthorizedAt = time.Time{}
+			row.task.UpdatedAt = at
+		case TaskPending, TaskRetryWait:
+			// 尚未被工作者持有的项挂起即可，恢复后重新领取。
+			row.task.State = TaskPaused
+			row.task.NextAttemptAt = time.Time{}
+			row.task.UpdatedAt = at
+		case TaskAuthorized:
+			// 已授权的邮件允许完成并接收回执，不做迁移。
+		}
+	}
+	cp := *c
+	return &cp, true, nil
+}
+
+func (s *memoryStore) ResumeCampaign(id string, at time.Time) (*Campaign, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	c, ok := s.campaigns[id]
+	if !ok {
+		return nil, false, newError(opStore, ErrNotFound, "campaign %s not found", id)
+	}
+	// 重复恢复（活动已在 running）返回稳定结果：changed=false。
+	if c.Status == CampaignRunning {
+		cp := *c
+		return &cp, false, nil
+	}
+	if c.Status != CampaignPaused {
+		return nil, false, newError(opStore, ErrConflict, "campaign %s is %s, only paused campaigns can resume", id, c.Status)
+	}
+	c.Status = CampaignRunning
+	c.ResumedAt = at
+
+	for _, key := range s.taskOrder[id] {
+		row := s.tasks[key]
+		if row.task.State != TaskPaused {
+			// 终态与暂停期间完成的已授权项保持不变。
+			continue
+		}
+		// 回到 pending：收件人与模板版本沿用启动时冻结的快照，
+		// 下次领取生成新 attempt/token；被围栏 attempt 上的拒绝决策保留为审计。
+		row.task.State = TaskPending
+		row.task.LeaseToken = ""
+		row.task.LeasedBy = ""
+		row.task.LeaseExpiresAt = time.Time{}
+		row.task.NextAttemptAt = time.Time{}
+		row.task.AuthID = 0
+		row.task.AuthorizedAt = time.Time{}
+		row.task.UpdatedAt = at
+	}
+	cp := *c
+	return &cp, true, nil
+}
+
 func (s *memoryStore) CancelCampaign(id string, at time.Time) (*Campaign, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -169,8 +270,8 @@ func (s *memoryStore) CancelCampaign(id string, at time.Time) (*Campaign, bool, 
 	for _, key := range s.taskOrder[id] {
 		row := s.tasks[key]
 		switch row.task.State {
-		case TaskPending, TaskRetryWait:
-			// 尚未被工作者持有的项直接进入 canceled 终态。
+		case TaskPending, TaskRetryWait, TaskPaused:
+			// 尚未被工作者持有、或被暂停围栏挂起的项直接进入 canceled 终态。
 			row.task.State = TaskCanceled
 			row.task.UpdatedAt = at
 		case TaskLeased, TaskAuthorized:
@@ -372,7 +473,20 @@ func (s *memoryStore) Authorize(key, token string, now time.Time) (*AuthDecision
 	s.nextAuthID++
 
 	campaign := s.campaigns[t.CampaignID]
-	if campaign == nil || campaign.Status != CampaignRunning {
+	if campaign == nil || campaign.Status == CampaignPaused {
+		// 暂停后不得授权新邮件：决策拒绝并持久化；任务保持/进入可恢复的 paused，
+		// 恢复后经新 attempt 重新处理（正常情况下暂停事务已提前围栏，这里是并发最后防线）。
+		dec.Granted = false
+		dec.Reason = ReasonCampaignPaused
+		cur.Decision = dec
+		if t.State != TaskPaused {
+			t.State = TaskPaused
+		}
+		t.UpdatedAt = now
+		cp := *dec
+		return &cp, nil
+	}
+	if campaign.Status != CampaignRunning {
 		// 取消后不得授权新邮件：决策拒绝并持久化，任务进入 canceled 终态。
 		dec.Granted = false
 		dec.Reason = ReasonCampaignCanceled
@@ -508,6 +622,7 @@ func (s *memoryStore) Stats(campaignID string) (CampaignStats, error) {
 		row := s.tasks[key]
 		st.Total++
 		st.TotalAttempts += len(row.attempts)
+		st.PausedIntercepted += row.pauseIntercepts
 		switch row.task.State {
 		case TaskPending:
 			st.Pending++
@@ -517,6 +632,8 @@ func (s *memoryStore) Stats(campaignID string) (CampaignStats, error) {
 			st.Authorized++
 		case TaskRetryWait:
 			st.RetryWait++
+		case TaskPaused:
+			st.Paused++
 		case TaskSent:
 			st.Sent++
 		case TaskFailed:
