@@ -1,6 +1,6 @@
 # go-email-dispatch
 
-抑制感知（suppression-aware）的批量邮件投递服务：管理活动（campaign）生命周期、冻结模板版本与受众、以有期限租约驱动工作者投递，并以**持久化发送授权点**为边界处理与领取/确认并发的抑制事件。
+抑制感知（suppression-aware）的批量邮件投递服务：管理活动（campaign）生命周期（启动、**暂停/恢复**、取消）、冻结模板版本与受众、以有期限租约驱动工作者投递，并以**持久化发送授权点**为边界处理与领取/确认并发的抑制事件。
 
 开发环境：Go 1.23.0，仅用标准库。
 
@@ -47,16 +47,33 @@
 - 永久失败直接 `failed`；成功为 `sent`。终态不可再领取。
 - 活动取消：`pending`/`retry_wait` 项立即进入 `canceled`，不再接受新领取；在途未授权项在授权点被拒（`campaign_canceled`）；已授权项如实等待回执。重复取消幂等（返回 `changed=false`），统计不会重复累加。
 
+### 6. 暂停与恢复（重点保护在途邮件）
+
+活动可在 `running ⇄ paused` 之间反复切换；暂停的裁决仍然只发生在**持久化授权点**，因此与领取/授权严格并发时每封邮件只有一个一致结果：
+
+- **暂停后，尚未获得发送授权的邮件不得继续**：
+  - `pending` / `retry_wait`：暂停期间不可领取（`Lease` 返回 `campaign_not_running`）；
+  - 已被工作者领取但尚未授权（`leased`）：暂停事务在该 attempt 上原子持久化一条 `granted=false, reason=campaign_paused` 决策，任务进入非终态 `paused`；旧工作者随后调用授权只会拿到这条不可变拒绝，不能发送；
+  - **已经授权的邮件不受暂停影响**：暂停期间仍可完成投递并接收回执（成功/临时失败/永久失败照常），重复回执幂等。
+- **恢复后沿用原收件人与模板快照**：模板版本、受众集合与变量快照始终是启动时冻结的版本；`paused` 任务回到 `pending`，重新领取产生**新 attempt + 新 lease_token**（fencing）。旧 token 永远只返回暂停时的拒绝决策，过期工作者无法再取得授权。
+- **暂停期间数据仍会变化**：退订、退信与活动抑制可照常录入，活动状态不影响抑制事件的生效；恢复后重新走到授权点时，这些事件以其 `occurred_at` 时序照常拦截（`global_unsubscribe` / `bounce` / `campaign_suppressed`）。暂停期间已授权邮件收到临时失败的，进入 `retry_wait`，恢复后退避到期才重试。
+- **不重复发送**：`sent` / `failed` / `suppressed` / `canceled` 等终态任务在恢复后不会重新领取或投递；暂停、恢复请求均幂等（重复调用返回 `changed=false`）。
+- 暂停态可直接取消：`paused` 任务转入 `canceled`（主动取消），其暂停拒绝决策仍保留在审计轨迹中。
+- 暂停中收到的回执若携带暂停后录入的抑制事件，同样只记入回执审计、不回滚已授权投递。
+
 ### 任务状态机
 
 ```
 pending ──lease──▶ leased ──authorize(granted)──▶ authorized ──receipt success──▶ sent (终态)
-                      │                                ├── permanent_failure ──▶ failed (终态)
-                      │                                └── temporary_failure ──▶ retry_wait
-                      │                                                              │ 退避到期
-                      │                                                              └──lease(attempt+1)
-                      ├── authorize(denied: suppression) ──▶ suppressed (终态)
-                      └── authorize(denied: canceled)    ──▶ canceled (终态)
+  ▲                   │                                ├── permanent_failure ──▶ failed (终态)
+  │                   │                                └── temporary_failure ──▶ retry_wait
+  │                   │                                                              │ 退避到期
+  │                   │                                                              └──lease(attempt+1)
+  │                   ├── authorize(denied: suppression) ──▶ suppressed (终态)
+  │                   ├── authorize(denied: canceled)    ──▶ canceled (终态)
+  │                   └── pause：持久化 campaign_paused 拒绝决策
+  │                            └──────────────────────▶ paused
+  └──────────── resume：paused 回到 pending，新 attempt/新 token 重新领取 ───────────┘
 ```
 
 ## 代码结构
@@ -89,6 +106,8 @@ go test -race ./...
 | POST | `/v1/campaigns/{id}/start` | 启动：锁定模板版本、冻结受众 |
 | GET | `/v1/campaigns/{id}` | 查询活动（含冻结快照） |
 | POST | `/v1/campaigns/{id}/leases` | 领取发送项（有期限租约） |
+| POST | `/v1/campaigns/{id}/pause` | 暂停活动（幂等） |
+| POST | `/v1/campaigns/{id}/resume` | 恢复活动（幂等） |
 | POST | `/v1/campaigns/{id}/dispatches/{key}/authorize` | 持久化发送授权点 |
 | POST | `/v1/campaigns/{id}/dispatches/{key}/receipts` | 提交发送回执 |
 | GET | `/v1/campaigns/{id}/dispatches/{key}` | 投递项审计轨迹 |
@@ -133,8 +152,13 @@ curl -s -XPOST localhost:8080/v1/campaigns/cmp_xxx/dispatches/dk_.../receipts -d
 }'
 # 重复提交 -> 200, {"duplicate":true,...}，统计不重复累加
 
-# 6. 统计 / 取消 / 审计
+# 6. 统计 / 暂停 / 恢复 / 取消 / 审计
 curl -s localhost:8080/v1/campaigns/cmp_xxx/stats
+# 暂停：已授权邮件仍可完成，未授权在途项的授权点返回 reason=campaign_paused
+curl -s -XPOST localhost:8080/v1/campaigns/cmp_xxx/pause -d '{}'
+# -> {"campaign":{"status":"paused",...},"changed":true}（重复暂停 changed=false）
+# 恢复：沿用冻结模板与收件人，被拦截任务以新 attempt 重新领取
+curl -s -XPOST localhost:8080/v1/campaigns/cmp_xxx/resume -d '{}'
 curl -s -XPOST localhost:8080/v1/campaigns/cmp_xxx/cancel -d '{}'
 curl -s localhost:8080/v1/campaigns/cmp_xxx/dispatches/dk_...
 ```
@@ -143,7 +167,9 @@ curl -s localhost:8080/v1/campaigns/cmp_xxx/dispatches/dk_...
 
 - 时长字段（`initial_backoff_ms`、`max_backoff_ms`、`lease_duration_ms`、`occurred_at_ms`）一律用**毫秒整数**。
 - `retry_policy` 缺省：最多 3 次尝试、30s 初始退避、10m 上限、2 倍乘数。
-- `stats` 计数完全由持久化任务状态派生（含 `total_attempts`、各状态计数、`finished`），重复回执/重复取消不产生增量。
+- `stats` 计数完全由持久化任务状态派生（含 `total_attempts`、各状态计数、`finished`），重复回执/重复取消不产生增量。暂停相关：
+  - `paused`：当前处于暂停拦截状态的任务数（恢复/取消后归零）；
+  - `pause_intercepted`：**累计**暂停拦截次数，由持久化的 `campaign_paused` 授权决策派生——每次暂停对每封在途邮件恰好 +1，恢复后保留，与 `canceled`（主动取消）和 `sent`（实际发送）相互区分、互不重复。
 
 ## 错误码
 
@@ -171,5 +197,9 @@ curl -s localhost:8080/v1/campaigns/cmp_xxx/dispatches/dk_...
 - 授权与抑制的时序竞争：授权前拦截、授权后仅审计；回填事件以 `occurred_at` 裁决；
 - 临时失败退避、退避到期前不可领取、预算耗尽终态、永久失败终态；
 - 取消后不授权/不领取、重复取消幂等、统计稳定；
+- 暂停/恢复：未授权在途邮件在授权点持久化拦截（旧 token 永远只拿到同一拒绝）、已授权邮件暂停期间照常完成并接收回执（含临时失败退避后恢复重试）；
+- 恢复沿用冻结模板版本与收件人变量快照，暂停期间录入的退订/退信在恢复后的授权点生效；终态邮件不重复投递，暂停/恢复幂等，暂停态可直接取消，拦截计数按持久化决策累计；
+- 暂停与领取/授权并发（`-race`，64 任务 × 8 工作者）：每封邮件恰好一个一致结论，暂停后无新授权，恢复后被拦截任务以新 attempt 重新领取；
+- 暂停/恢复 HTTP 接口与统计字段、非法状态切换的 409 conflict；
 - HTTP 端到端与错误码/状态码映射；
 - 并发场景（`-race`）：同一回执 32 路并发仅生效一次；取消与领取并发后不存在任何新授权。

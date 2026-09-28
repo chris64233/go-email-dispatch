@@ -14,6 +14,8 @@ const (
 	CampaignDraft CampaignStatus = "draft"
 	// CampaignRunning 已启动：模板版本与受众快照不可变，可以领取与授权发送。
 	CampaignRunning CampaignStatus = "running"
+	// CampaignPaused 已暂停：不再领取/授权新邮件；已授权邮件仍可完成并接收回执，可恢复。
+	CampaignPaused CampaignStatus = "paused"
 	// CampaignCanceled 已取消：不再授权任何新邮件。
 	CampaignCanceled CampaignStatus = "canceled"
 )
@@ -26,6 +28,7 @@ const (
 	TaskLeased     TaskState = "leased"     // 已被某个工作者租约持有，尚未授权
 	TaskAuthorized TaskState = "authorized" // 已越过持久化发送授权点，允许实际投递
 	TaskRetryWait  TaskState = "retry_wait" // 临时失败，等待退避后重试
+	TaskPaused     TaskState = "paused"     // 活动暂停：已领取但未获授权，在当前 attempt 的授权点被持久化拦截
 	TaskSent       TaskState = "sent"       // 终态：成功
 	TaskFailed     TaskState = "failed"     // 终态：永久失败或重试耗尽
 	TaskSuppressed TaskState = "suppressed" // 终态：授权点被抑制拦截
@@ -171,7 +174,10 @@ type Campaign struct {
 	RetryPolicy RetryPolicy `json:"retry_policy"`
 	CreatedAt   time.Time   `json:"created_at"`
 	StartedAt   time.Time   `json:"started_at,omitempty"`
-	CanceledAt  time.Time   `json:"canceled_at,omitempty"`
+	// PausedAt / ResumedAt 记录最近一次暂停/恢复时刻；同一活动可反复暂停与恢复。
+	PausedAt   time.Time `json:"paused_at,omitempty"`
+	ResumedAt  time.Time `json:"resumed_at,omitempty"`
+	CanceledAt time.Time `json:"canceled_at,omitempty"`
 }
 
 // CampaignSpec 是创建活动的入参。
@@ -229,6 +235,7 @@ type AuthDecision struct {
 // 授权拒绝原因码。
 const (
 	ReasonCampaignCanceled   = "campaign_canceled"
+	ReasonCampaignPaused     = "campaign_paused"
 	ReasonCampaignSuppressed = "campaign_suppressed"
 	ReasonGlobalUnsubscribe  = "global_unsubscribe"
 	ReasonBounce             = "bounce"
@@ -308,13 +315,17 @@ type CampaignStats struct {
 	Leased          int            `json:"leased"`
 	Authorized      int            `json:"authorized"`
 	RetryWait       int            `json:"retry_wait"`
+	Paused          int            `json:"paused"`
 	Sent            int            `json:"sent"`
 	Failed          int            `json:"failed"`
 	Suppressed      int            `json:"suppressed"`
 	Canceled        int            `json:"canceled"`
 	// TotalAttempts 是累计租约尝试次数（每次重试 +1）。
 	TotalAttempts int `json:"total_attempts"`
-	Terminal      int `json:"terminal"`
+	// PauseIntercepted 是累计暂停拦截次数：暂停时刻在授权点被持久化拒绝的领取中任务数，
+	// 每次暂停累加一次/任务（由授权决策派生，暂停-恢复-再暂停会增长）。
+	PauseIntercepted int `json:"pause_intercepted"`
+	Terminal         int `json:"terminal"`
 	// Finished 表示所有投递项都已进入终态（活动状态可能仍为 running）。
 	Finished bool `json:"finished"`
 }
