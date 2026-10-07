@@ -38,6 +38,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	POST   /v1/campaigns/{id}/dispatches/{key}/authorize     持久化发送授权点
 	POST   /v1/campaigns/{id}/dispatches/{key}/receipts      提交发送回执
 	POST   /v1/suppressions                                  录入抑制事件
+	POST   /v1/campaigns/{id}/retention-rules                提交合规保留规则（幂等）
+	GET    /v1/campaigns/{id}/retention-rules                列出保留规则（历史查询）
+	GET    /v1/campaigns/{id}/retention-rules/{rule}         查询单条规则
+	POST   /v1/campaigns/{id}/retention-rules/{rule}/release 解除规则（幂等）
 */
 func (h *Handler) routes() {
 	h.mux.HandleFunc("POST /v1/campaigns", h.createCampaign)
@@ -50,6 +54,10 @@ func (h *Handler) routes() {
 	h.mux.HandleFunc("POST /v1/campaigns/{id}/dispatches/{key}/authorize", h.authorize)
 	h.mux.HandleFunc("POST /v1/campaigns/{id}/dispatches/{key}/receipts", h.receipt)
 	h.mux.HandleFunc("POST /v1/suppressions", h.suppression)
+	h.mux.HandleFunc("POST /v1/campaigns/{id}/retention-rules", h.upsertRetentionRule)
+	h.mux.HandleFunc("GET /v1/campaigns/{id}/retention-rules", h.listRetentionRules)
+	h.mux.HandleFunc("GET /v1/campaigns/{id}/retention-rules/{rule}", h.getRetentionRule)
+	h.mux.HandleFunc("POST /v1/campaigns/{id}/retention-rules/{rule}/release", h.releaseRetentionRule)
 }
 
 type leaseRequestDTO struct {
@@ -238,6 +246,80 @@ func (h *Handler) suppression(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, ev)
+}
+
+type retentionRuleRequestDTO struct {
+	RuleID        string          `json:"rule_id"`
+	Action        RetentionAction `json:"action"`
+	Scope         []string        `json:"scope"`
+	Reason        string          `json:"reason"`
+	EffectiveAtMS *int64          `json:"effective_at_ms,omitempty"`
+	ExpiresAtMS   *int64          `json:"expires_at_ms,omitempty"`
+	TTLMS         *int64          `json:"ttl_ms,omitempty"`
+}
+
+func (h *Handler) upsertRetentionRule(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	var dto retentionRuleRequestDTO
+	if err := decodeJSON(r, &dto); err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	in := RetentionRuleInput{
+		RuleID: dto.RuleID,
+		Action: dto.Action,
+		Scope:  dto.Scope,
+		Reason: dto.Reason,
+	}
+	if dto.EffectiveAtMS != nil {
+		in.EffectiveAt = time.UnixMilli(*dto.EffectiveAtMS).UTC()
+	}
+	if dto.ExpiresAtMS != nil {
+		in.ExpiresAt = time.UnixMilli(*dto.ExpiresAtMS).UTC()
+	}
+	if dto.TTLMS != nil {
+		in.TTL = time.Duration(*dto.TTLMS) * time.Millisecond
+	}
+	ack, err := h.svc.UpsertRetentionRule(id, in)
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	status := http.StatusCreated
+	if !ack.Created {
+		status = http.StatusOK
+	}
+	writeJSON(w, status, ack)
+}
+
+func (h *Handler) listRetentionRules(w http.ResponseWriter, r *http.Request) {
+	rules, err := h.svc.ListRetentionRules(r.PathValue("id"))
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	if rules == nil {
+		rules = []RetentionRule{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"rules": rules})
+}
+
+func (h *Handler) getRetentionRule(w http.ResponseWriter, r *http.Request) {
+	rule, err := h.svc.GetRetentionRule(r.PathValue("id"), r.PathValue("rule"))
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, rule)
+}
+
+func (h *Handler) releaseRetentionRule(w http.ResponseWriter, r *http.Request) {
+	rule, changed, err := h.svc.ReleaseRetentionRule(r.PathValue("id"), r.PathValue("rule"))
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"rule": rule, "changed": changed})
 }
 
 // ---- HTTP 辅助 ----

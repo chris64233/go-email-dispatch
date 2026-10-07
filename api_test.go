@@ -227,3 +227,141 @@ func TestAPIStaleLeaseConflict(t *testing.T) {
 		t.Fatalf("expected 409 campaign_not_running, got %d %v", status, body)
 	}
 }
+
+// doHandler 直接经 Handler（Recorder）调用，不占用监听端口。
+func doHandler(t *testing.T, h *Handler, method, path string, body any) (int, map[string]any) {
+	t.Helper()
+	var rdr *bytes.Reader
+	if body != nil {
+		raw, _ := json.Marshal(body)
+		rdr = bytes.NewReader(raw)
+	} else {
+		rdr = bytes.NewReader(nil)
+	}
+	req := httptest.NewRequest(method, path, rdr)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	var out map[string]any
+	if rec.Body.Len() > 0 {
+		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+			t.Fatalf("decode %d: %v body=%s", rec.Code, err, rec.Body.String())
+		}
+	}
+	return rec.Code, out
+}
+
+// TestAPIRetentionRules 走通规则提交（201）、重复提交（200 原记录）、冲突（409）、
+// 列表/单查/解除，以及解除后领取授权成功。
+func TestAPIRetentionRules(t *testing.T) {
+	svc, clk := newTestService()
+	h := NewHTTPHandler(svc)
+	c, err := svc.CreateCampaign(CampaignSpec{Name: "c"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := c.ID
+	if _, err := svc.StartCampaign(id, StartSpec{
+		TemplateVersion: "tpl-1",
+		Recipients:      []Recipient{{Address: "a@x.com"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	base := "/v1/campaigns/" + id + "/retention-rules"
+
+	status, out := doHandler(t, h, "POST", base, map[string]any{
+		"rule_id": "R-API", "action": "freeze", "scope": []string{"a@x.com"},
+		"reason": "legal request", "ttl_ms": 3600000,
+	})
+	if status != http.StatusCreated {
+		t.Fatalf("create status=%d body=%v", status, out)
+	}
+	if asMap(t, out["rule"])["status"] != string(RuleActive) {
+		t.Fatalf("expected active rule, got %v", out)
+	}
+
+	// 相同内容重复提交 -> 200, created=false。
+	status, out = doHandler(t, h, "POST", base, map[string]any{
+		"rule_id": "R-API", "action": "freeze", "scope": []string{"a@x.com"},
+		"reason": "legal request", "ttl_ms": 3600000,
+	})
+	if status != http.StatusOK || out["created"] != false {
+		t.Fatalf("idempotent resubmit: status=%d body=%v", status, out)
+	}
+
+	// 范围变化 -> 409。
+	status, out = doHandler(t, h, "POST", base, map[string]any{
+		"rule_id": "R-API", "action": "freeze", "scope": []string{"other@x.com"},
+		"reason": "legal request", "ttl_ms": 3600000,
+	})
+	if status != http.StatusConflict {
+		t.Fatalf("conflict expected, got %d %v", status, out)
+	}
+
+	// 校验错误 -> 400。
+	status, _ = doHandler(t, h, "POST", base, map[string]any{
+		"rule_id": "R-X", "action": "freeze", "reason": "x", "ttl_ms": 1000,
+	})
+	if status != http.StatusBadRequest {
+		t.Fatalf("validation status=%d", status)
+	}
+
+	// 列表与单查。
+	status, out = doHandler(t, h, "GET", base, nil)
+	if status != http.StatusOK {
+		t.Fatalf("list status=%d body=%v", status, out)
+	}
+	rules, ok := out["rules"].([]any)
+	if !ok || len(rules) != 1 {
+		t.Fatalf("expected 1 rule, got %v", out)
+	}
+	status, _ = doHandler(t, h, "GET", base+"/R-API", nil)
+	if status != http.StatusOK {
+		t.Fatalf("get rule status=%d", status)
+	}
+
+	// 冻结期间领取为空。
+	if tasks, _ := svc.Lease(id, LeaseRequest{WorkerID: "w", LeaseDuration: time.Minute}); len(tasks) != 0 {
+		t.Fatalf("frozen task must not lease, got %d", len(tasks))
+	}
+
+	// 解除 -> changed=true；再次解除 -> changed=false。
+	status, out = doHandler(t, h, "POST", base+"/R-API/release", map[string]any{})
+	if status != http.StatusOK || out["changed"] != true {
+		t.Fatalf("release status=%d body=%v", status, out)
+	}
+	status, out = doHandler(t, h, "POST", base+"/R-API/release", map[string]any{})
+	if status != http.StatusOK || out["changed"] != false {
+		t.Fatalf("repeat release status=%d body=%v", status, out)
+	}
+
+	// 解除后领取、授权成功；查询投递项能看到模板版本与当前依据（nil）。
+	tasks, _ := svc.Lease(id, LeaseRequest{WorkerID: "w", LeaseDuration: time.Minute})
+	if len(tasks) != 1 {
+		t.Fatalf("expected task after release, got %d", len(tasks))
+	}
+	key := tasks[0].DispatchKey
+	status, out = doHandler(t, h, "POST",
+		"/v1/campaigns/"+id+"/dispatches/"+key+"/authorize",
+		map[string]any{"lease_token": tasks[0].LeaseToken})
+	if status != http.StatusOK || !asMap(t, out)["granted"].(bool) {
+		t.Fatalf("authorize status=%d body=%v", status, out)
+	}
+	status, out = doHandler(t, h, "GET", "/v1/campaigns/"+id+"/dispatches/"+key, nil)
+	if status != http.StatusOK || asMap(t, out)["template_version"] != "tpl-1" {
+		t.Fatalf("dispatch detail status=%d body=%v", status, out)
+	}
+
+	// 已解除的规则推进到过期后仍保持 released（解除是明确终态）。
+	clk.advance(2 * time.Hour)
+	status, out = doHandler(t, h, "GET", base+"/R-API", nil)
+	if status != http.StatusOK || asMap(t, out)["status"] != string(RuleReleased) {
+		t.Fatalf("released rule status=%d body=%v", status, out)
+	}
+
+	// 解除不存在的规则 -> 404。
+	status, _ = doHandler(t, h, "POST", base+"/nope/release", map[string]any{})
+	if status != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", status)
+	}
+}

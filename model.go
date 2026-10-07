@@ -26,6 +26,7 @@ const (
 	TaskLeased     TaskState = "leased"     // 已被某个工作者租约持有，尚未授权
 	TaskAuthorized TaskState = "authorized" // 已越过持久化发送授权点，允许实际投递
 	TaskRetryWait  TaskState = "retry_wait" // 临时失败，等待退避后重试
+	TaskHeld       TaskState = "held"       // 合规冻结：尚未授权，等待解除/失效后重新判断
 	TaskSent       TaskState = "sent"       // 终态：成功
 	TaskFailed     TaskState = "failed"     // 终态：永久失败或重试耗尽
 	TaskSuppressed TaskState = "suppressed" // 终态：授权点被抑制拦截
@@ -52,6 +53,65 @@ const (
 	// ResultPermanentFailure 永久失败（硬退信、被拒等），直接进入终态。
 	ResultPermanentFailure ReceiptResult = "permanent_failure"
 )
+
+// RetentionAction 是合规保留规则对命中收件人采取的动作。
+type RetentionAction string
+
+const (
+	// RetentionFreeze 冻结：规则有效期内暂停发送，尚未授权的邮件在授权点被拒并进入 held。
+	RetentionFreeze RetentionAction = "freeze"
+	// RetentionRetain 保留依据：不阻止发送，但规则生效后新生成的邮件必须携带不可变的保留依据。
+	RetentionRetain RetentionAction = "retain"
+)
+
+// RetentionRuleStatus 是保留规则的生命周期状态。
+type RetentionRuleStatus string
+
+const (
+	RuleActive   RetentionRuleStatus = "active"   // 生效中（仍在有效期内）
+	RuleReleased RetentionRuleStatus = "released" // 已被运营人员解除
+	RuleExpired  RetentionRuleStatus = "expired"  // 已超过有效期（惰性派生）
+)
+
+// RetentionRule 是按活动、收件人范围、原因与有效期保存的合规保留规则。
+// 规则号（RuleID）由调用方提供并在活动内唯一；重复提交按内容做幂等/冲突判定。
+type RetentionRule struct {
+	RuleID      string              `json:"rule_id"`
+	CampaignID  string              `json:"campaign_id"`
+	Action      RetentionAction     `json:"action"`
+	Scope       []string            `json:"scope"` // 规范化后的收件地址集合
+	Reason      string              `json:"reason"`
+	EffectiveAt time.Time           `json:"effective_at"`
+	ExpiresAt   time.Time           `json:"expires_at"`
+	Status      RetentionRuleStatus `json:"status"`
+	CreatedAt   time.Time           `json:"created_at"`
+	ReleasedAt  time.Time           `json:"released_at,omitempty"`
+}
+
+// EffectiveAtTime 报告规则在 at 时刻是否处于有效期且未被解除。
+func (r RetentionRule) EffectiveAtTime(at time.Time) bool {
+	if r.Status != RuleActive {
+		return false
+	}
+	return !r.EffectiveAt.After(at) && r.ExpiresAt.After(at)
+}
+
+// Matches 报告规范化地址是否落在规则范围内。
+func (r RetentionRule) Matches(address string) bool {
+	for _, a := range r.Scope {
+		if a == address {
+			return true
+		}
+	}
+	return false
+}
+
+// RetentionBasis 是随新邮件携带的不可变发送依据；授权落库后即不再变化。
+type RetentionBasis struct {
+	RuleID string          `json:"rule_id"`
+	Action RetentionAction `json:"action"`
+	Reason string          `json:"reason"`
+}
 
 // SuppressionType 是抑制事件类型。
 type SuppressionType string
@@ -199,8 +259,10 @@ type Task struct {
 	NextAttemptAt  time.Time `json:"next_attempt_at,omitempty"`
 	AuthID         int64     `json:"auth_id,omitempty"`
 	AuthorizedAt   time.Time `json:"authorized_at,omitempty"`
-	FailureReason  string    `json:"failure_reason,omitempty"`
-	UpdatedAt      time.Time `json:"updated_at"`
+	// HeldByRule 非空时表示任务正被某条合规冻结规则持有；解除/失效后清空并回到 pending。
+	HeldByRule    string    `json:"held_by_rule,omitempty"`
+	FailureReason string    `json:"failure_reason,omitempty"`
+	UpdatedAt     time.Time `json:"updated_at"`
 }
 
 // LeasedTask 是领取成功后返回给工作者的发送项视图。
@@ -213,6 +275,9 @@ type LeasedTask struct {
 	Attempt         int               `json:"attempt"`
 	LeaseToken      string            `json:"lease_token"`
 	LeaseExpiresAt  time.Time         `json:"lease_expires_at"`
+	// Basis 是本批新生成邮件携带的不可变保留依据；无匹配规则时为 nil。
+	// 同一批次返回的所有任务 Basis 相同（无依据批次统一为 nil），避免新旧决定混批。
+	Basis *RetentionBasis `json:"basis,omitempty"`
 }
 
 // AuthDecision 是持久化的“发送授权点”记录。
@@ -224,6 +289,8 @@ type AuthDecision struct {
 	At           time.Time          `json:"at"`
 	Reason       string             `json:"reason,omitempty"`
 	Suppressions []SuppressionEvent `json:"suppressions,omitempty"`
+	// Basis 是授权时刻快照下来的保留依据；授权后规则变化不影响该决策。
+	Basis *RetentionBasis `json:"basis,omitempty"`
 }
 
 // 授权拒绝原因码。
@@ -232,6 +299,7 @@ const (
 	ReasonCampaignSuppressed = "campaign_suppressed"
 	ReasonGlobalUnsubscribe  = "global_unsubscribe"
 	ReasonBounce             = "bounce"
+	ReasonComplianceHeld     = "compliance_hold"
 )
 
 // ReceiptRecord 是某次尝试回执的持久化记录；Audit 保留授权点之后事件的解释性信息。
@@ -258,9 +326,13 @@ type AttemptRecord struct {
 
 // DispatchDetail 是一个投递项的审计视图。
 type DispatchDetail struct {
-	Task      Task             `json:"task"`
-	Recipient Recipient        `json:"recipient"`
-	Attempts  []*AttemptRecord `json:"attempts"`
+	Task            Task      `json:"task"`
+	CampaignID      string    `json:"campaign_id"`
+	Recipient       Recipient `json:"recipient"`
+	TemplateVersion string    `json:"template_version"`
+	// CurrentBasis 是查询时刻仍对该收件人有效的保留依据（可能晚于已落库决策，仅作展示）。
+	CurrentBasis *RetentionBasis  `json:"current_basis,omitempty"`
+	Attempts     []*AttemptRecord `json:"attempts"`
 }
 
 // SuppressionEvent 是抑制事件；OccurredAt 为生效时间，可早于录入时间。
@@ -312,6 +384,7 @@ type CampaignStats struct {
 	Failed          int            `json:"failed"`
 	Suppressed      int            `json:"suppressed"`
 	Canceled        int            `json:"canceled"`
+	Held            int            `json:"held"`
 	// TotalAttempts 是累计租约尝试次数（每次重试 +1）。
 	TotalAttempts int `json:"total_attempts"`
 	Terminal      int `json:"terminal"`
