@@ -30,6 +30,9 @@ const (
 	TaskFailed     TaskState = "failed"     // 终态：永久失败或重试耗尽
 	TaskSuppressed TaskState = "suppressed" // 终态：授权点被抑制拦截
 	TaskCanceled   TaskState = "canceled"   // 终态：活动取消，未再投递
+	// TaskFrozen 非终态：授权点被合规保留规则（freeze）拦截；
+	// 规则解除或失效后可重新领取并在授权点重新判断。
+	TaskFrozen TaskState = "frozen"
 )
 
 // IsTerminal 报告状态是否为终态。
@@ -213,6 +216,79 @@ type LeasedTask struct {
 	Attempt         int               `json:"attempt"`
 	LeaseToken      string            `json:"lease_token"`
 	LeaseExpiresAt  time.Time         `json:"lease_expires_at"`
+	// RuleEpoch 是领取时刻的合规规则纪元：同一批次只包含同一纪元的任务，
+	// 规则变更（新增/解除）会推进纪元，已授权与待重判的邮件不会混批。
+	RuleEpoch int64 `json:"rule_epoch"`
+}
+
+// RetentionAction 是合规保留规则的动作类型。
+type RetentionAction string
+
+const (
+	// RetentionActionFreeze 冻结：命中收件人在授权点被拒（可解除后重判）。
+	RetentionActionFreeze RetentionAction = "freeze"
+	// RetentionActionRetain 保留：命中邮件的授权决策必须携带不可变发送依据。
+	RetentionActionRetain RetentionAction = "retain"
+)
+
+// RetentionRule 是合规保留规则：按活动、收件人范围、原因与有效期保存。
+// RuleNo 是调用方提供的规则号，作为活动内幂等键。
+type RetentionRule struct {
+	ID            int64           `json:"id"`
+	RuleNo        string          `json:"rule_no"`
+	CampaignID    string          `json:"campaign_id"`
+	Action        RetentionAction `json:"action"`
+	AllRecipients bool            `json:"all_recipients"`
+	Addresses     []string        `json:"addresses,omitempty"`
+	Reason        string          `json:"reason"`
+	EffectiveAt   time.Time       `json:"effective_at"`
+	ExpiresAt     time.Time       `json:"expires_at"`
+	LiftedAt      time.Time       `json:"lifted_at,omitempty"`
+	CreatedAt     time.Time       `json:"created_at"`
+}
+
+// Active 报告规则在 at 时刻是否生效（含边界：EffectiveAt <= at < ExpiresAt，且未解除）。
+func (r *RetentionRule) Active(at time.Time) bool {
+	return !r.EffectiveAt.After(at) && r.ExpiresAt.After(at) && r.LiftedAt.IsZero()
+}
+
+// Covers 报告规则是否覆盖指定（已规范化）地址。
+func (r *RetentionRule) Covers(address string) bool {
+	if r.AllRecipients {
+		return true
+	}
+	for _, a := range r.Addresses {
+		if a == address {
+			return true
+		}
+	}
+	return false
+}
+
+// samePayload 报告两条规则除规则号外的业务载荷是否一致（幂等判定用）。
+func (r *RetentionRule) samePayload(o *RetentionRule) bool {
+	if r.Action != o.Action || r.AllRecipients != o.AllRecipients ||
+		r.Reason != o.Reason || !r.EffectiveAt.Equal(o.EffectiveAt) || !r.ExpiresAt.Equal(o.ExpiresAt) {
+		return false
+	}
+	if len(r.Addresses) != len(o.Addresses) {
+		return false
+	}
+	for i := range r.Addresses {
+		if r.Addresses[i] != o.Addresses[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// RetentionBasis 是随授权决策持久化的不可变发送依据快照。
+type RetentionBasis struct {
+	RuleNo          string          `json:"rule_no"`
+	Action          RetentionAction `json:"action"`
+	Reason          string          `json:"reason"`
+	TemplateVersion string          `json:"template_version"`
+	DecidedAt       time.Time       `json:"decided_at"`
 }
 
 // AuthDecision 是持久化的“发送授权点”记录。
@@ -224,6 +300,12 @@ type AuthDecision struct {
 	At           time.Time          `json:"at"`
 	Reason       string             `json:"reason,omitempty"`
 	Suppressions []SuppressionEvent `json:"suppressions,omitempty"`
+	// RuleEpoch 是决策时的合规规则纪元。
+	RuleEpoch int64 `json:"rule_epoch"`
+	// Basis 是命中 retain 规则时随决策落库的不可变发送依据（含模板版本与保留原因）。
+	Basis []RetentionBasis `json:"basis,omitempty"`
+	// Retention 是命中 freeze 规则被拒时的规则快照。
+	Retention *RetentionBasis `json:"retention,omitempty"`
 }
 
 // 授权拒绝原因码。
@@ -232,6 +314,7 @@ const (
 	ReasonCampaignSuppressed = "campaign_suppressed"
 	ReasonGlobalUnsubscribe  = "global_unsubscribe"
 	ReasonBounce             = "bounce"
+	ReasonRetentionFrozen    = "retention_frozen"
 )
 
 // ReceiptRecord 是某次尝试回执的持久化记录；Audit 保留授权点之后事件的解释性信息。
@@ -282,6 +365,45 @@ type ReceiptInput struct {
 	Message           string        `json:"message,omitempty"`
 }
 
+// RetentionRuleInput 是提交合规保留规则的入参。
+type RetentionRuleInput struct {
+	RuleNo        string          `json:"rule_no"`
+	Action        RetentionAction `json:"action"`
+	AllRecipients bool            `json:"all_recipients,omitempty"`
+	Addresses     []string        `json:"addresses,omitempty"`
+	Reason        string          `json:"reason"`
+	// EffectiveAt 生效时刻；留空取提交时刻。
+	EffectiveAt time.Time `json:"effective_at,omitempty"`
+	// ExpiresAt 失效时刻（必填，开区间边界）。
+	ExpiresAt time.Time `json:"expires_at"`
+}
+
+// RetentionRuleAck 是规则提交结果。Duplicate=true 表示同规则号同载荷的重复提交，
+// 返回的是首次落库的原记录。
+type RetentionRuleAck struct {
+	Rule      *RetentionRule `json:"rule"`
+	Duplicate bool           `json:"duplicate"`
+}
+
+// RetentionRecipientView 是单个收件人的合规视图：
+// 当前命中规则、采用的模板版本与保留/冻结原因。
+type RetentionRecipientView struct {
+	Address         string           `json:"address"`
+	TemplateVersion string           `json:"template_version"`
+	Frozen          bool             `json:"frozen"`
+	Rules           []RetentionBasis `json:"rules,omitempty"`
+}
+
+// RetentionReport 是活动级合规保留查询结果。
+type RetentionReport struct {
+	CampaignID      string                   `json:"campaign_id"`
+	Status          CampaignStatus           `json:"status"`
+	TemplateVersion string                   `json:"template_version"`
+	RuleEpoch       int64                    `json:"rule_epoch"`
+	Rules           []RetentionRule          `json:"rules"`
+	Recipients      []RetentionRecipientView `json:"recipients"`
+}
+
 // LeaseRequest 是领取请求。
 type LeaseRequest struct {
 	WorkerID      string        `json:"worker_id"`
@@ -312,6 +434,8 @@ type CampaignStats struct {
 	Failed          int            `json:"failed"`
 	Suppressed      int            `json:"suppressed"`
 	Canceled        int            `json:"canceled"`
+	// Frozen 当前被合规保留规则冻结、等待重判的投递项数（非终态）。
+	Frozen int `json:"frozen"`
 	// TotalAttempts 是累计租约尝试次数（每次重试 +1）。
 	TotalAttempts int `json:"total_attempts"`
 	Terminal      int `json:"terminal"`

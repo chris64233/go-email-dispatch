@@ -27,6 +27,14 @@ type Store interface {
 	// SuppressionsRecordedSince 返回 after 之后录入、且匹配活动/地址的抑制事件（用于授权后审计）。
 	SuppressionsFor(campaignID, address string) []SuppressionEvent
 
+	// PutRetentionRule 落库合规保留规则；同规则号同载荷返回原记录（duplicate=true），
+	// 同规则号不同载荷返回冲突。规则创建会推进活动规则纪元。
+	PutRetentionRule(rule *RetentionRule) (duplicate bool, err error)
+	// LiftRetentionRule 解除规则（幂等：重复解除 changed=false），并推进规则纪元。
+	LiftRetentionRule(campaignID, ruleNo string, at time.Time) (*RetentionRule, bool, error)
+	// RetentionReport 返回活动合规视图（当前规则、每收件人命中情况、模板版本与原因）。
+	RetentionReport(campaignID string, now time.Time) (*RetentionReport, error)
+
 	// LeaseTasks 原子领取至多 count 个就绪项，写入新租约与 attempt 记录。
 	LeaseTasks(campaignID string, workerID string, count int, dur time.Duration, now time.Time) ([]LeasedTask, error)
 	// Authorize 是持久化发送授权点：决策（无论放行/拒绝）先落库再返回。
@@ -58,8 +66,14 @@ type memoryStore struct {
 	// campaignSupp: campaignID -> address -> 事件
 	campaignSupp map[string]map[string][]*SuppressionEvent
 
+	// retention: campaignID -> ruleNo -> 规则
+	retention map[string]map[string]*RetentionRule
+	// ruleEpoch: campaignID -> 规则纪元（规则创建/解除时 +1）
+	ruleEpoch map[string]int64
+
 	nextEventID int64
 	nextAuthID  int64
+	nextRuleID  int64
 }
 
 // NewMemoryStore 返回进程内持久化实现（串行化所有事务，适合单节点与测试）。
@@ -71,8 +85,11 @@ func NewMemoryStore() Store {
 		tasks:        map[string]*taskRow{},
 		globalSupp:   map[string][]*SuppressionEvent{},
 		campaignSupp: map[string]map[string][]*SuppressionEvent{},
+		retention:    map[string]map[string]*RetentionRule{},
+		ruleEpoch:    map[string]int64{},
 		nextEventID:  1,
 		nextAuthID:   1,
+		nextRuleID:   1,
 	}
 }
 
@@ -246,10 +263,140 @@ func (s *memoryStore) SuppressionsFor(campaignID, address string) []SuppressionE
 	return out
 }
 
+func cloneRulePtr(p *RetentionRule) *RetentionRule {
+	if p == nil {
+		return nil
+	}
+	cp := *p
+	if p.Addresses != nil {
+		cp.Addresses = append([]string(nil), p.Addresses...)
+	}
+	return &cp
+}
+
+func (s *memoryStore) PutRetentionRule(rule *RetentionRule) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.campaigns[rule.CampaignID]; !ok {
+		return false, newError(opStore, ErrNotFound, "campaign %s not found", rule.CampaignID)
+	}
+	m := s.retention[rule.CampaignID]
+	if m == nil {
+		m = map[string]*RetentionRule{}
+		s.retention[rule.CampaignID] = m
+	}
+	if existing, ok := m[rule.RuleNo]; ok {
+		// 相同规则号重复提交：载荷一致返回原记录，范围/有效期等变化返回冲突。
+		if existing.samePayload(rule) {
+			cp := cloneRulePtr(existing)
+			*rule = *cp
+			return true, nil
+		}
+		return false, newError(opStore, ErrConflict,
+			"retention rule %s already exists with different scope, validity or payload", rule.RuleNo)
+	}
+	rule.ID = s.nextRuleID
+	s.nextRuleID++
+	m[rule.RuleNo] = cloneRulePtr(rule)
+	s.ruleEpoch[rule.CampaignID]++
+	return false, nil
+}
+
+func (s *memoryStore) LiftRetentionRule(campaignID, ruleNo string, at time.Time) (*RetentionRule, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.campaigns[campaignID]; !ok {
+		return nil, false, newError(opStore, ErrNotFound, "campaign %s not found", campaignID)
+	}
+	rule, ok := s.retention[campaignID][ruleNo]
+	if !ok {
+		return nil, false, newError(opStore, ErrNotFound, "retention rule %s not found in campaign %s", ruleNo, campaignID)
+	}
+	if !rule.LiftedAt.IsZero() {
+		// 重复解除幂等：返回稳定结果。
+		return cloneRulePtr(rule), false, nil
+	}
+	rule.LiftedAt = at
+	s.ruleEpoch[campaignID]++
+	return cloneRulePtr(rule), true, nil
+}
+
+// activeRetentionRules 返回 at 时刻生效且覆盖 address 的规则。调用方须持有 s.mu。
+func (s *memoryStore) activeRetentionRules(campaignID, address string, at time.Time) []*RetentionRule {
+	var out []*RetentionRule
+	for _, r := range s.retention[campaignID] {
+		if r.Active(at) && r.Covers(address) {
+			out = append(out, r)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
+}
+
+func (s *memoryStore) RetentionReport(campaignID string, now time.Time) (*RetentionReport, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	c, ok := s.campaigns[campaignID]
+	if !ok {
+		return nil, newError(opStore, ErrNotFound, "campaign %s not found", campaignID)
+	}
+	rep := &RetentionReport{
+		CampaignID:      campaignID,
+		Status:          c.Status,
+		TemplateVersion: c.TemplateVersion,
+		RuleEpoch:       s.ruleEpoch[campaignID],
+		Rules:           []RetentionRule{},
+		Recipients:      []RetentionRecipientView{},
+	}
+	rules := s.retention[campaignID]
+	ids := make([]int64, 0, len(rules))
+	byID := map[int64]*RetentionRule{}
+	for _, r := range rules {
+		ids = append(ids, r.ID)
+		byID[r.ID] = r
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	for _, id := range ids {
+		rep.Rules = append(rep.Rules, *cloneRulePtr(byID[id]))
+	}
+	for _, key := range s.taskOrder[campaignID] {
+		row := s.tasks[key]
+		view := RetentionRecipientView{
+			Address:         row.recipient.Address,
+			TemplateVersion: c.TemplateVersion,
+		}
+		for _, r := range s.activeRetentionRules(campaignID, row.recipient.Address, now) {
+			if r.Action == RetentionActionFreeze {
+				view.Frozen = true
+			}
+			view.Rules = append(view.Rules, RetentionBasis{
+				RuleNo:          r.RuleNo,
+				Action:          r.Action,
+				Reason:          r.Reason,
+				TemplateVersion: c.TemplateVersion,
+				DecidedAt:       now,
+			})
+		}
+		rep.Recipients = append(rep.Recipients, view)
+	}
+	return rep, nil
+}
+
 // readyForLease 报告任务是否可被领取。调用方须持有 s.mu。
-func readyForLease(row *taskRow, now time.Time) bool {
+func (s *memoryStore) readyForLease(row *taskRow, now time.Time) bool {
 	switch row.task.State {
 	case TaskPending:
+		return true
+	case TaskFrozen:
+		// 冻结项仅在当前已无任何生效 freeze 规则覆盖时可重新领取（重判）。
+		for _, r := range s.activeRetentionRules(row.task.CampaignID, row.task.Recipient, now) {
+			if r.Action == RetentionActionFreeze {
+				return false
+			}
+		}
 		return true
 	case TaskRetryWait:
 		return !row.task.NextAttemptAt.After(now)
@@ -280,7 +427,7 @@ func (s *memoryStore) LeaseTasks(campaignID, workerID string, count int, dur tim
 			break
 		}
 		row := s.tasks[key]
-		if !readyForLease(row, now) {
+		if !s.readyForLease(row, now) {
 			continue
 		}
 		row.task.Attempt++
@@ -311,6 +458,7 @@ func (s *memoryStore) LeaseTasks(campaignID, workerID string, count int, dur tim
 			Attempt:         n,
 			LeaseToken:      token,
 			LeaseExpiresAt:  expires,
+			RuleEpoch:       s.ruleEpoch[campaignID],
 		})
 	}
 	return out, nil
@@ -368,7 +516,7 @@ func (s *memoryStore) Authorize(key, token string, now time.Time) (*AuthDecision
 		return nil, newError(opStore, ErrInvalidState, "task %s is %s, authorize requires leased", key, t.State)
 	}
 
-	dec := &AuthDecision{ID: s.nextAuthID, Attempt: cur.Number, At: now}
+	dec := &AuthDecision{ID: s.nextAuthID, Attempt: cur.Number, At: now, RuleEpoch: s.ruleEpoch[t.CampaignID]}
 	s.nextAuthID++
 
 	campaign := s.campaigns[t.CampaignID]
@@ -394,6 +542,38 @@ func (s *memoryStore) Authorize(key, token string, now time.Time) (*AuthDecision
 		t.UpdatedAt = now
 		cp := *dec
 		return &cp, nil
+	}
+
+	// 合规保留规则复查：freeze 命中则拒绝（任务进入可重判的 frozen 态）；
+	// retain 命中则把不可变发送依据随决策一并落库。
+	if hits := s.activeRetentionRules(t.CampaignID, t.Recipient, now); len(hits) > 0 {
+		frozen := false
+		for _, r := range hits {
+			basis := RetentionBasis{
+				RuleNo:          r.RuleNo,
+				Action:          r.Action,
+				Reason:          r.Reason,
+				TemplateVersion: campaign.TemplateVersion,
+				DecidedAt:       now,
+			}
+			if r.Action == RetentionActionFreeze {
+				frozen = true
+				b := basis
+				dec.Retention = &b
+			} else {
+				dec.Basis = append(dec.Basis, basis)
+			}
+		}
+		if frozen {
+			dec.Granted = false
+			dec.Reason = ReasonRetentionFrozen
+			cur.Decision = dec
+			t.State = TaskFrozen
+			t.FailureReason = dec.Reason
+			t.UpdatedAt = now
+			cp := *dec
+			return &cp, nil
+		}
 	}
 
 	dec.Granted = true
@@ -525,6 +705,8 @@ func (s *memoryStore) Stats(campaignID string) (CampaignStats, error) {
 			st.Suppressed++
 		case TaskCanceled:
 			st.Canceled++
+		case TaskFrozen:
+			st.Frozen++
 		}
 		if row.task.State.IsTerminal() {
 			st.Terminal++

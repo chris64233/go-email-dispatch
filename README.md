@@ -47,6 +47,21 @@
 - 永久失败直接 `failed`；成功为 `sent`。终态不可再领取。
 - 活动取消：`pending`/`retry_wait` 项立即进入 `canceled`，不再接受新领取；在途未授权项在授权点被拒（`campaign_canceled`）；已授权项如实等待回执。重复取消幂等（返回 `changed=false`），统计不会重复累加。
 
+### 6. 合规保留（retention rules）
+
+运营可在活动发送期间提交两类合规规则，规则按**活动 + 规则号 + 收件人范围 + 原因 + 有效期**保存：
+
+| 动作 | 语义 |
+| --- | --- |
+| `freeze` 冻结 | 命中收件人在授权点被拒（`retention_frozen`），任务进入非终态 `frozen`；规则解除或失效后可重新领取并重判 |
+| `retain` 保留 | 命中邮件的授权决策必须携带**不可变发送依据**（规则号、原因、冻结的模板版本、决策时刻），随决策一并落库 |
+
+- **授权点裁决**：已授权邮件保留原决定；尚未授权的邮件在规则变更后按当前规则重新判断。每次领取/授权都携带单调递增的 `rule_epoch`，同一领取批次只包含同一纪元的任务，已授权与待重判的邮件不会混批。
+- **并发与 fencing**：冻结、解除冻结与授权并发时，同一收件人只落库一个明确决策；规则解除后旧 attempt 的迟到回执返回 `stale_attempt`，迟到的旧工作者无法绕过当前规则。
+- **幂等与冲突**：相同规则号重复提交且载荷一致时返回原记录（`duplicate=true`）；范围、有效期、原因等任一变化返回 `conflict`。解除操作幂等（重复解除 `changed=false`）。
+- **有效期边界**：规则仅在 `effective_at <= now < expires_at` 且未解除时生效；失效后不影响任何已完成的发送，已落库的依据快照保持不可变。
+- **查询与脱敏**：`GET /v1/campaigns/{id}/retention` 返回活动、每个收件人、当前命中规则、采用的模板版本与保留原因；普通操作日志中的地址一律脱敏（`a***@example.com`），不出现完整敏感地址。
+
 ### 任务状态机
 
 ```
@@ -56,7 +71,8 @@ pending ──lease──▶ leased ──authorize(granted)──▶ authorized
                       │                                                              │ 退避到期
                       │                                                              └──lease(attempt+1)
                       ├── authorize(denied: suppression) ──▶ suppressed (终态)
-                      └── authorize(denied: canceled)    ──▶ canceled (终态)
+                      ├── authorize(denied: canceled)    ──▶ canceled (终态)
+                      └── authorize(denied: retention freeze) ──▶ frozen ──规则解除/失效后重新领取──▶ leased
 ```
 
 ## 代码结构
@@ -95,6 +111,9 @@ go test -race ./...
 | POST | `/v1/suppressions` | 录入抑制事件 |
 | POST | `/v1/campaigns/{id}/cancel` | 取消活动（幂等） |
 | GET | `/v1/campaigns/{id}/stats` | 统计查询 |
+| POST | `/v1/campaigns/{id}/retention-rules` | 提交合规保留规则（规则号幂等） |
+| POST | `/v1/campaigns/{id}/retention-rules/{ruleNo}/lift` | 解除合规保留规则（幂等） |
+| GET | `/v1/campaigns/{id}/retention` | 合规保留查询（当前规则/模板版本/保留原因） |
 
 错误响应统一形如 `{"error":{"code":"...","message":"..."}}`，状态码：400（校验/非法回执）、404（不存在）、409（状态冲突、租约失效、fencing、活动未运行）。
 
@@ -171,5 +190,10 @@ curl -s localhost:8080/v1/campaigns/cmp_xxx/dispatches/dk_...
 - 授权与抑制的时序竞争：授权前拦截、授权后仅审计；回填事件以 `occurred_at` 裁决；
 - 临时失败退避、退避到期前不可领取、预算耗尽终态、永久失败终态；
 - 取消后不授权/不领取、重复取消幂等、统计稳定；
+- 合规保留：freeze 在授权点拦截、解除后重判放行、迟到旧工作者被 fencing 拒绝；
+- 规则有效期边界（生效前/失效后不拦截、失效不影响已完成发送）；
+- 规则号幂等（重复提交返回原记录、范围/有效期变化返回冲突）；
+- retain 依据随授权落库（含模板版本与保留原因）、已授权邮件保留原决定、历史查询视图；
+- 解除冻结与授权并发只产生一个明确结果；普通日志地址脱敏；
 - HTTP 端到端与错误码/状态码映射；
 - 并发场景（`-race`）：同一回执 32 路并发仅生效一次；取消与领取并发后不存在任何新授权。

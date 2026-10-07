@@ -13,6 +13,19 @@ func normalizeAddress(addr string) string {
 	return strings.ToLower(strings.TrimSpace(addr))
 }
 
+// MaskAddress 返回地址的脱敏形态（保留首字符与域名），用于普通日志，避免泄露敏感地址。
+func MaskAddress(addr string) string {
+	addr = normalizeAddress(addr)
+	local, domain, ok := strings.Cut(addr, "@")
+	if !ok {
+		return "***"
+	}
+	if local == "" {
+		return "***@" + domain
+	}
+	return local[:1] + "***@" + domain
+}
+
 // newToken 生成不可猜测的租约令牌。
 func newToken() string {
 	var b [16]byte

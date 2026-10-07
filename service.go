@@ -1,6 +1,7 @@
 package emaildispatch
 
 import (
+	"log"
 	"strings"
 	"time"
 )
@@ -19,11 +20,23 @@ const opService = "service"
 type Service struct {
 	store Store
 	now   func() time.Time
+	// logger 接收操作审计日志；地址一律脱敏后输出。为 nil 时不记录。
+	logger *log.Logger
 }
 
 // NewService 使用默认时钟构造服务。
 func NewService(store Store) *Service {
 	return &Service{store: store, now: time.Now}
+}
+
+// SetLogger 设置操作日志记录器（普通日志，敏感地址会被脱敏）。
+func (svc *Service) SetLogger(l *log.Logger) { svc.logger = l }
+
+// logf 输出脱敏后的操作日志。
+func (svc *Service) logf(format string, args ...any) {
+	if svc.logger != nil {
+		svc.logger.Printf(format, args...)
+	}
 }
 
 // NewServiceWithClock 注入时钟，供测试精确控制租约过期、退避与事件时序。
@@ -207,6 +220,111 @@ func (svc *Service) Cancel(campaignID string) (*Campaign, bool, error) {
 		return nil, false, err
 	}
 	return c, changed, nil
+}
+
+// SubmitRetentionRule 提交合规保留规则（freeze/retain）。
+//   - 规则号在活动内幂等：同号同载荷返回原记录（Duplicate=true），
+//     同号但范围/有效期/原因等变化返回 ErrConflict；
+//   - 规则生效后，新生成的授权决策必须携带对应依据（retain）或被冻结拦截（freeze）；
+//   - 已授权邮件保留原决定，未授权邮件在授权点按当前规则重新判断。
+func (svc *Service) SubmitRetentionRule(campaignID string, in RetentionRuleInput) (RetentionRuleAck, error) {
+	if strings.TrimSpace(campaignID) == "" {
+		return RetentionRuleAck{}, newError(opService, ErrValidation, "campaign_id is required")
+	}
+	ruleNo := strings.TrimSpace(in.RuleNo)
+	if ruleNo == "" {
+		return RetentionRuleAck{}, newError(opService, ErrValidation, "rule_no is required")
+	}
+	if in.Action != RetentionActionFreeze && in.Action != RetentionActionRetain {
+		return RetentionRuleAck{}, newError(opService, ErrValidation,
+			"action must be one of freeze|retain, got %q", in.Action)
+	}
+	reason := strings.TrimSpace(in.Reason)
+	if reason == "" {
+		return RetentionRuleAck{}, newError(opService, ErrValidation, "reason is required")
+	}
+	if in.ExpiresAt.IsZero() {
+		return RetentionRuleAck{}, newError(opService, ErrValidation, "expires_at is required")
+	}
+	now := svc.now().UTC()
+	effective := in.EffectiveAt.UTC()
+	if effective.IsZero() {
+		effective = now
+	}
+	expires := in.ExpiresAt.UTC()
+	if !expires.After(effective) {
+		return RetentionRuleAck{}, newError(opService, ErrValidation,
+			"expires_at must be after effective_at")
+	}
+
+	rule := &RetentionRule{
+		RuleNo:        ruleNo,
+		CampaignID:    campaignID,
+		Action:        in.Action,
+		AllRecipients: in.AllRecipients,
+		Reason:        reason,
+		EffectiveAt:   effective,
+		ExpiresAt:     expires,
+		CreatedAt:     now,
+	}
+	if !in.AllRecipients {
+		if len(in.Addresses) == 0 {
+			return RetentionRuleAck{}, newError(opService, ErrValidation,
+				"addresses or all_recipients is required to define recipient scope")
+		}
+		seen := map[string]struct{}{}
+		for _, a := range in.Addresses {
+			addr := normalizeAddress(a)
+			if addr == "" || !strings.Contains(addr, "@") {
+				return RetentionRuleAck{}, newError(opService, ErrValidation, "invalid address %q", a)
+			}
+			if _, dup := seen[addr]; dup {
+				continue
+			}
+			seen[addr] = struct{}{}
+			rule.Addresses = append(rule.Addresses, addr)
+		}
+	}
+
+	dup, err := svc.store.PutRetentionRule(rule)
+	if err != nil {
+		return RetentionRuleAck{}, err
+	}
+	if !dup {
+		svc.logf("retention rule %s created campaign=%s action=%s scope=%s expires_at=%s",
+			rule.RuleNo, campaignID, rule.Action, maskedScope(rule), rule.ExpiresAt.Format(time.RFC3339))
+	}
+	return RetentionRuleAck{Rule: rule, Duplicate: dup}, nil
+}
+
+// LiftRetentionRule 解除规则。解除与授权并发时，授权点在当前规则快照下裁决，
+// 同一收件人只会留下一个明确结果；重复解除幂等（Changed=false）。
+func (svc *Service) LiftRetentionRule(campaignID, ruleNo string) (*RetentionRule, bool, error) {
+	rule, changed, err := svc.store.LiftRetentionRule(campaignID, strings.TrimSpace(ruleNo), svc.now().UTC())
+	if err != nil {
+		return nil, false, err
+	}
+	if changed {
+		svc.logf("retention rule %s lifted campaign=%s", rule.RuleNo, campaignID)
+	}
+	return rule, changed, nil
+}
+
+// RetentionReport 返回活动合规视图：活动、收件人、当前生效规则、模板版本与保留原因。
+func (svc *Service) RetentionReport(campaignID string) (*RetentionReport, error) {
+	return svc.store.RetentionReport(campaignID, svc.now().UTC())
+}
+
+// maskedScope 返回脱敏后的规则范围描述，普通日志不得出现完整敏感地址。
+func maskedScope(rule *RetentionRule) string {
+	if rule.AllRecipients {
+		return "all"
+	}
+	parts := make([]string, 0, len(rule.Addresses))
+	for _, a := range rule.Addresses {
+		parts = append(parts, MaskAddress(a))
+	}
+	return strings.Join(parts, ",")
 }
 
 // Stats 返回活动统计；计数全部由任务持久化状态派生，重复回执/取消不会重复累加。

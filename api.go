@@ -38,6 +38,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	POST   /v1/campaigns/{id}/dispatches/{key}/authorize     持久化发送授权点
 	POST   /v1/campaigns/{id}/dispatches/{key}/receipts      提交发送回执
 	POST   /v1/suppressions                                  录入抑制事件
+	POST   /v1/campaigns/{id}/retention-rules                提交合规保留规则（规则号幂等）
+	POST   /v1/campaigns/{id}/retention-rules/{ruleNo}/lift  解除合规保留规则（幂等）
+	GET    /v1/campaigns/{id}/retention                      合规保留查询（当前规则/模板版本/原因）
 */
 func (h *Handler) routes() {
 	h.mux.HandleFunc("POST /v1/campaigns", h.createCampaign)
@@ -50,6 +53,9 @@ func (h *Handler) routes() {
 	h.mux.HandleFunc("POST /v1/campaigns/{id}/dispatches/{key}/authorize", h.authorize)
 	h.mux.HandleFunc("POST /v1/campaigns/{id}/dispatches/{key}/receipts", h.receipt)
 	h.mux.HandleFunc("POST /v1/suppressions", h.suppression)
+	h.mux.HandleFunc("POST /v1/campaigns/{id}/retention-rules", h.createRetentionRule)
+	h.mux.HandleFunc("POST /v1/campaigns/{id}/retention-rules/{ruleNo}/lift", h.liftRetentionRule)
+	h.mux.HandleFunc("GET /v1/campaigns/{id}/retention", h.retentionReport)
 }
 
 type leaseRequestDTO struct {
@@ -241,6 +247,65 @@ func (h *Handler) suppression(w http.ResponseWriter, r *http.Request) {
 }
 
 // ---- HTTP 辅助 ----
+
+type retentionRuleRequestDTO struct {
+	RuleNo        string          `json:"rule_no"`
+	Action        RetentionAction `json:"action"`
+	AllRecipients bool            `json:"all_recipients,omitempty"`
+	Addresses     []string        `json:"addresses,omitempty"`
+	Reason        string          `json:"reason"`
+	EffectiveAtMS *int64          `json:"effective_at_ms,omitempty"`
+	ExpiresAtMS   *int64          `json:"expires_at_ms,omitempty"`
+}
+
+func (h *Handler) createRetentionRule(w http.ResponseWriter, r *http.Request) {
+	var dto retentionRuleRequestDTO
+	if err := decodeJSON(r, &dto); err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	in := RetentionRuleInput{
+		RuleNo:        dto.RuleNo,
+		Action:        dto.Action,
+		AllRecipients: dto.AllRecipients,
+		Addresses:     dto.Addresses,
+		Reason:        dto.Reason,
+	}
+	if dto.EffectiveAtMS != nil {
+		in.EffectiveAt = time.UnixMilli(*dto.EffectiveAtMS).UTC()
+	}
+	if dto.ExpiresAtMS != nil {
+		in.ExpiresAt = time.UnixMilli(*dto.ExpiresAtMS).UTC()
+	}
+	ack, err := h.svc.SubmitRetentionRule(r.PathValue("id"), in)
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	status := http.StatusCreated
+	if ack.Duplicate {
+		status = http.StatusOK
+	}
+	writeJSON(w, status, ack)
+}
+
+func (h *Handler) liftRetentionRule(w http.ResponseWriter, r *http.Request) {
+	rule, changed, err := h.svc.LiftRetentionRule(r.PathValue("id"), r.PathValue("ruleNo"))
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"rule": rule, "changed": changed})
+}
+
+func (h *Handler) retentionReport(w http.ResponseWriter, r *http.Request) {
+	rep, err := h.svc.RetentionReport(r.PathValue("id"))
+	if err != nil {
+		writeDomainError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, rep)
+}
 
 func decodeJSON(r *http.Request, v any) error {
 	if r.Body == nil {
